@@ -15,6 +15,7 @@
 - GET  /batches/{batch_id}/inventory   查询原始样本库存余额
 - POST /batches/{batch_id}/preparations 批次制备：正整数次数，沿配方图整数消耗原始样本库存（不足 409 且整体回滚）
 - POST /preparation-jobs               整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足 409 且整单回滚）
+- POST /preparation-jobs/selection-preview 只读排产预演：1～12 条候选制备单按同一库存快照选型（不扣库存、不写记录）
 - GET  /preparations/{preparation_id}  按记录 id 查询制备记录（含消耗明细与当前剩余库存）
 """
 from __future__ import annotations
@@ -59,6 +60,8 @@ from .schemas import (
     RecipePreviewOut,
     RecipePreviewRequest,
     SampleCreate,
+    SelectionPreviewOut,
+    SelectionPreviewRequest,
 )
 from .service import (
     PoolPlanError,
@@ -70,6 +73,7 @@ from .service import (
     preparation_requirements,
     reachable_samples,
     recipe_preview,
+    select_preparation_subset,
 )
 
 
@@ -1060,4 +1064,95 @@ def create_preparation_job(
             for batch_id in ids
         ],
         consumptions=[consumption_out(sid, total[sid]) for sid in sample_ids],
+    )
+
+
+@app.post(
+    "/preparation-jobs/selection-preview",
+    response_model=SelectionPreviewOut,
+    summary="只读排产预演：按同一库存快照为候选制备单选型（不扣库存、不写记录）",
+)
+def preview_preparation_job_selection(
+    payload: SelectionPreviewRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SelectionPreviewOut:
+    # 订单按请求位置（从 1 开始）标识：同一批次重复出现时不合并次数，
+    # 各自作为独立候选订单参与选型
+    items = payload.items
+
+    # 未知批次沿用 /preparation-jobs 的约定：按业务输入错误返回 400
+    ids = sorted({item.batch_id for item in items})
+    placeholders = ", ".join("?" for _ in ids)
+    found = {
+        row["id"]
+        for row in conn.execute(f"SELECT id FROM batches WHERE id IN ({placeholders})", ids)
+    }
+    missing = [i for i in ids if i not in found]
+    if missing:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}")
+
+    # 显式只读事务：需求展开、余额读取与样本名称解析都落在同一快照中，
+    # 并发补库/制备不会在预演中途混入；纯 SELECT 不阻塞其他写事务
+    conn.execute("BEGIN")
+    try:
+        # 复用配方图整数消耗展开：每条候选订单按其批次与次数得到各原始样本需求
+        demands = [
+            preparation_requirements(conn, item.batch_id, item.times) for item in items
+        ]
+        balances = {
+            r["sample_id"]: r["balance"]
+            for r in conn.execute("SELECT sample_id, balance FROM sample_inventory")
+        }
+
+        selected, unselected = select_preparation_subset(
+            demands, [item.times for item in items], balances
+        )
+
+        # 入选订单按样本汇总的总消耗
+        consumed: dict[int, int] = {}
+        for position in selected:
+            for sample_id, portions in demands[position - 1].items():
+                consumed[sample_id] = consumed.get(sample_id, 0) + portions
+
+        sample_ids = sorted(consumed)
+        rows = (
+            conn.execute(
+                """
+                SELECT b.id AS sample_id, b.name AS sample_name,
+                       COALESCE(si.balance, 0) AS balance, si.updated_at AS updated_at
+                FROM batches b
+                LEFT JOIN sample_inventory si ON si.sample_id = b.id
+                WHERE b.id IN (%s)
+                ORDER BY b.id
+                """
+                % ", ".join("?" for _ in sample_ids),
+                sample_ids,
+            ).fetchall()
+            if sample_ids
+            else []
+        )
+        info = {r["sample_id"]: r for r in rows}
+    finally:
+        conn.rollback()  # 只读预演：任何路径都不落盘
+
+    return SelectionPreviewOut(
+        selected_positions=selected,
+        unselected_positions=unselected,
+        consumptions=[
+            PreparationConsumptionOut(
+                sample_id=sid,
+                sample_name=info[sid]["sample_name"],
+                portions=consumed[sid],
+            )
+            for sid in sample_ids
+        ],
+        remaining_inventory=[
+            InventoryOut(
+                sample_id=sid,
+                sample_name=info[sid]["sample_name"],
+                balance=info[sid]["balance"] - consumed[sid],
+                updated_at=info[sid]["updated_at"],
+            )
+            for sid in sample_ids
+        ],
     )

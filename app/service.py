@@ -425,3 +425,49 @@ def preparation_job_requirements(
         }
         for batch_id, times in items
     }
+
+
+def select_preparation_subset(
+    demands: list[dict[int, int]],
+    times: list[int],
+    balances: dict[int, int],
+) -> tuple[list[int], list[int]]:
+    """只读排产选型：从候选制备单中选出库存可承载的子集。
+
+    - demands[i]、times[i] 为第 i 条候选订单（0 起下标）按配方图展开的
+      {原始样本 id: 整数需求} 与制备次数，三者等长；
+    - balances 为同一库存快照下各样本余额（未列出的样本视为 0）；
+    - 可行子集：入选订单对每一样本的总需求都不超过该样本余额（空集恒可行）；
+    - 选型优先级：先最大化入选订单数，再最大化入选制备次数之和，
+      仍并列时取入选位置序列（1 起位置，升序）字典序最小者。
+
+    返回 (selected, unselected)：均为 1 起请求位置、按位置升序的列表。
+    纯内存计算，不读不写数据库。候选最多 12 条，直接枚举全部子集。
+    """
+    n = len(demands)
+    best_key: tuple[int, int, tuple[int, ...]] | None = None
+    best_positions: tuple[int, ...] = ()
+    for mask in range(1 << n):
+        total: dict[int, int] = {}
+        count = 0
+        times_sum = 0
+        for i in range(n):
+            if not mask >> i & 1:
+                continue
+            count += 1
+            times_sum += times[i]
+            for sample_id, portions in demands[i].items():
+                total[sample_id] = total.get(sample_id, 0) + portions
+        if any(total[sid] > balances.get(sid, 0) for sid in total):
+            continue
+        positions = tuple(i + 1 for i in range(n) if mask >> i & 1)
+        # 订单数、次数之和越大越优；位置序列字典序越小越优（元组比较即序列字典序）
+        key = (count, times_sum, tuple(-p for p in positions))
+        if best_key is None or key > best_key:
+            best_key = key
+            best_positions = positions
+    selected = set(best_positions)
+    return (
+        list(best_positions),
+        [i + 1 for i in range(n) if i + 1 not in selected],
+    )
