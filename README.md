@@ -15,6 +15,7 @@
 - **份数诊断**：假设混样配方仅一项投入份数记错，按实测原始样本占比用有理数方程反推该项的正整数份数，并用全部样本占比复核；份数变化不改变组成且与实测吻合的项列为**无法判定**；**不修改数据库**
 - **原始样本库存与批次制备**：可为已有原始样本补入**正整数份**库存并查询余额；`POST /batches/{id}/preparations` 按**正整数次数**制备批次，每制备一次混样按其配方消耗相应份数的上游批次，沿配方图逐层乘算、多路径需求合并为各原始样本的**整数消耗**（原始样本目标直接消耗自身）；核算与扣减在**同一 SQLite 写事务**内完成，任一样本库存不足即返回 **409** 与各样缺口、库存与制备记录均不变化，足量时一次扣减并保存目标批次、次数与消耗明细，可按记录 id 查询
 - **整单制备**：`POST /preparation-jobs` 一次接收**非空制备清单**（每项为已有批次 id + 正整数制备次数），同一批次重复出现时先**合并次数**；先沿配方图计算每项对原始样本的整数需求，再**按样本汇总整单需求**统一核算（共享样本不会被各项分别判为足量）；读取余额、核算缺口、扣减库存与写入各批次制备记录在**同一写事务**完成，任一样本不足返回包含该样本**总需求、余额与缺口**的 **409**、整单不留记录且余额不变；成功时返回各批次制备记录 id 与整单消耗，每条记录仍可由 `GET /preparations/{id}` 读取
+- **排产选择预演**：`POST /preparation-jobs/selection-preview` 接收 **1～12 条候选制备单**（每条为已有批次 id + 正整数次数，按**请求位置**标识订单、**允许重复批次**且不合并次数），复用配方图整数消耗展开计算每条订单对原始样本的需求，依据**同一库存快照**选出各样本总需求均不超过余额的子集——先**最大化入选订单数**，再**最大化入选制备次数之和**，仍并列时取**入选位置序列字典序最小**者；返回入选与未入选位置、按样本汇总的消耗及剩余库存，库存不足时允许**空集**；**只读：不扣减库存、不创建制备记录**
 - 依赖安装与数据库建表全部纳入启动流程，无需手工初始化
 
 ## 快速开始（Docker）
@@ -64,6 +65,7 @@ docker compose up --build
 | `GET` | `/batches/{id}/inventory` | 查询原始样本库存余额（未补入为 0） |
 | `POST` | `/batches/{id}/preparations` | 批次制备：按整数次数消耗原始样本库存（不足 409 且整体回滚） |
 | `POST` | `/preparation-jobs` | 整单制备：多批次清单合并次数、按样本汇总需求一次扣减（不足 409 且整单回滚） |
+| `POST` | `/preparation-jobs/selection-preview` | 排产选择预演：1～12 条候选制备单按同一库存快照选最优可行子集（只读，不扣库存） |
 | `GET` | `/preparations/{id}` | 按记录 id 查询制备记录（消耗明细 + 当前剩余库存） |
 
 ## 示例请求
@@ -510,6 +512,47 @@ curl -X POST http://localhost:8000/preparation-jobs \
 - 与单批次制备共用同一写事务模型：并发的整单与单批次制备相互串行，不会超扣，失败方不留任何记录；
 - 409 时 `shortages` 中的 `required` 是该样本的**整单总需求**（各项合并后的值），不是单项需求。
 
+### 12. 排产选择预演（只读排产）
+
+`POST /preparation-jobs/selection-preview`（服务地址 `http://localhost:8000`）接收 **1～12 条候选制备单** `items`，每条为 `batch_id`（已有批次，原始样本或混样均可）+ `times`（正整数制备次数）：
+
+- 每条订单按**请求位置**（`items` 数组下标，**从 0 开始**）标识；**允许同一批次出现在多个位置**——与整单制备不同，此处**不合并次数**，每个位置都是独立订单；
+- 复用配方图整数消耗展开计算**每条订单**对原始样本的需求，再依据**同一库存快照**（一次读出的各样本余额，选择过程中不随订单扣减）选出可行子集：入选订单对每一样本的**汇总需求均不超过余额**；
+- 最优子集的选取顺序：先**最大化入选订单数**，再**最大化入选制备次数之和**，仍并列时取**入选位置序列字典序最小**者；库存不足时允许**空集**（`selected_positions` 与 `consumptions` 均为空列表）；
+- 返回 `selected_positions` / `unselected_positions`（均升序）、入选订单按样本汇总的 `consumptions`、以及快照余额减去入选消耗后的 `remaining_inventory`；
+- **只读**：不扣减库存、不创建制备记录，调用前后 `GET /batches/{id}/inventory` 与 `GET /preparations/{id}` 的结果保持原样。
+
+沿用前面的批次（P1=`1×S1+1×S2` id=3，P2=`1×P1+1×S1` id=4，每次制备需 `2×S1 + 1×S2`）。假设当前 S1 余 4 份、S2 余 2 份，提交 3 条候选（P2 在位置 0、2 重复出现，各自独立成单）：
+
+```bash
+curl -X POST http://localhost:8000/preparation-jobs/selection-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"items": [{"batch_id": 4, "times": 1}, {"batch_id": 3, "times": 1}, {"batch_id": 4, "times": 1}]}'
+```
+
+```json
+{
+  "selected_positions": [0, 1],
+  "unselected_positions": [2],
+  "consumptions": [
+    {"sample_id": 1, "sample_name": "S1", "portions": 3},
+    {"sample_id": 2, "sample_name": "S2", "portions": 2}
+  ],
+  "remaining_inventory": [
+    {"sample_id": 1, "sample_name": "S1", "balance": 1, "updated_at": "2026-09-25T11:00:00.000Z"},
+    {"sample_id": 2, "sample_name": "S2", "balance": 0, "updated_at": "2026-09-25T11:00:00.000Z"}
+  ]
+}
+```
+
+三条全选需 `5×S1` 超过余额；任意两条的组合都可行（`{0,2}` 恰好耗尽 S1），入选订单数同为 2、次数之和同为 2，故取位置序列字典序最小的 `[0, 1]`。预演**不占用库存**：随后把同样的清单提交 `/preparation-jobs` 仍可成功扣减。
+
+说明：
+
+- 清单为空或**超过 12 条**返回 **422**；引用不存在的批次返回 **400**；制备次数非严格正整数（0、负数、小数、字符串、布尔）返回 **422**；
+- 从未补入库存的样本可用份数为 0；某一样本余额为 0 时，所有需要它的订单都不会入选；
+- 共享样本按入选子集的**汇总需求**与快照余额比较，不会让各订单分别判为可行。
+
 ### 错误示例
 
 ```bash
@@ -611,6 +654,18 @@ curl -X POST http://localhost:8000/preparation-jobs -H 'Content-Type: applicatio
   -d '{"items": [{"batch_id": 4, "times": 1}, {"batch_id": 3, "times": 2}]}'
 # {"detail":{"message":"原始样本库存不足","shortages":[{"sample_id":1,"required":4,...}]}}
 
+# 排产选择预演：空清单或超过 12 条 → 422
+curl -X POST http://localhost:8000/preparation-jobs/selection-preview -H 'Content-Type: application/json' \
+  -d '{"items": []}'
+
+# 排产选择预演：引用未知批次 → 400 {"detail":"未知批次 id: [999]"}
+curl -X POST http://localhost:8000/preparation-jobs/selection-preview -H 'Content-Type: application/json' \
+  -d '{"items": [{"batch_id": 999, "times": 1}]}'
+
+# 排产选择预演：制备次数非正整数 → 422
+curl -X POST http://localhost:8000/preparation-jobs/selection-preview -H 'Content-Type: application/json' \
+  -d '{"items": [{"batch_id": 4, "times": 0}]}'
+
 # 查询不存在的制备记录 → 404
 curl http://localhost:8000/preparations/999
 ```
@@ -636,12 +691,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入、批次制备与整单制备端点）
+  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入、批次制备、整单制备与排产选择预演端点）
   db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则、库存与制备记录表及写事务设置）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
-  service.py    # 递归占比计算、配方图可达原始样本、禁配补录影响预演、目标占比反算、配方预演、份数诊断与制备整数消耗（Fraction 精确分数）
+  service.py    # 递归占比计算、配方图可达原始样本、禁配补录影响预演、目标占比反算、配方预演、份数诊断、制备整数消耗与排产子集选择（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、整单制备、并发与各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、整单制备、排产选择预演、并发与各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt

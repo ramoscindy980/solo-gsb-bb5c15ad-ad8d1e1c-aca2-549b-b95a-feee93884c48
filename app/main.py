@@ -15,6 +15,7 @@
 - GET  /batches/{batch_id}/inventory   查询原始样本库存余额
 - POST /batches/{batch_id}/preparations 批次制备：正整数次数，沿配方图整数消耗原始样本库存（不足 409 且整体回滚）
 - POST /preparation-jobs               整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足 409 且整单回滚）
+- POST /preparation-jobs/selection-preview 排产选择预演：按同一库存快照选最优可行订单子集（只读，不扣库存）
 - GET  /preparations/{preparation_id}  按记录 id 查询制备记录（含消耗明细与当前剩余库存）
 """
 from __future__ import annotations
@@ -54,6 +55,8 @@ from .schemas import (
     PreparationJobCreateRequest,
     PreparationJobOut,
     PreparationOut,
+    PreparationSelectionPreviewOut,
+    PreparationSelectionPreviewRequest,
     PreviewComponentOut,
     RecipeItemOut,
     RecipePreviewOut,
@@ -70,6 +73,7 @@ from .service import (
     preparation_requirements,
     reachable_samples,
     recipe_preview,
+    selection_preview,
 )
 
 
@@ -1060,4 +1064,72 @@ def create_preparation_job(
             for batch_id in ids
         ],
         consumptions=[consumption_out(sid, total[sid]) for sid in sample_ids],
+    )
+
+
+@app.post(
+    "/preparation-jobs/selection-preview",
+    response_model=PreparationSelectionPreviewOut,
+    summary="排产选择预演：按同一库存快照选最优可行订单子集（只读，不扣减库存）",
+)
+def preview_preparation_selection(
+    payload: PreparationSelectionPreviewRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PreparationSelectionPreviewOut:
+    # 与整单制备一致：未知批次按业务输入错误返回 400（重复批次只校验一次）
+    ids = sorted({item.batch_id for item in payload.items})
+    found = {
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM batches WHERE id IN (%s)" % ", ".join("?" for _ in ids),
+            ids,
+        )
+    }
+    missing = [i for i in ids if i not in found]
+    if missing:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}")
+
+    # 每个请求位置都是独立订单（允许重复批次，不合并次数）；
+    # 依据同一库存快照选最优可行子集，全程只读：不扣减库存、不创建制备记录
+    items = [(item.batch_id, item.times) for item in payload.items]
+    selected, consumption, balances = selection_preview(conn, items)
+
+    # 被消耗的样本必然存在（需求为正且不超过余额）；名称与补库时间一次性解析
+    sample_ids = sorted(consumption)
+    info = (
+        {
+            r["id"]: r
+            for r in conn.execute(
+                """
+                SELECT b.id, b.name, si.updated_at
+                FROM batches b
+                LEFT JOIN sample_inventory si ON si.sample_id = b.id
+                WHERE b.id IN (%s)
+                """
+                % ", ".join("?" for _ in sample_ids),
+                sample_ids,
+            )
+        }
+        if sample_ids
+        else {}
+    )
+    selected_set = set(selected)
+    return PreparationSelectionPreviewOut(
+        selected_positions=selected,
+        unselected_positions=[i for i in range(len(items)) if i not in selected_set],
+        consumptions=[
+            PreparationConsumptionOut(
+                sample_id=sid, sample_name=info[sid]["name"], portions=consumption[sid]
+            )
+            for sid in sample_ids
+        ],
+        remaining_inventory=[
+            InventoryOut(
+                sample_id=sid,
+                sample_name=info[sid]["name"],
+                balance=balances.get(sid, 0) - consumption[sid],
+                updated_at=info[sid]["updated_at"],
+            )
+            for sid in sample_ids
+        ],
     )

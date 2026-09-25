@@ -1694,3 +1694,202 @@ def test_concurrent_preparation_jobs_serialize_without_overselling(client):
     list_resp = [client.get(f"/preparations/{i}").status_code for i in range(1, 7)]
     assert list_resp == [200] * 5 + [404]
 
+
+# --------------------------------------------------------------------------- #
+# POST /preparation-jobs/selection-preview 排产选择预演（只读）
+# --------------------------------------------------------------------------- #
+
+
+def selection_preview(client, items):
+    return client.post("/preparation-jobs/selection-preview", json={"items": items})
+
+
+def make_p1_p2(client):
+    """P1 = 1×S1 + 1×S2；P2 = 1×P1 + 1×S1（每次 2×S1 + 1×S2）。"""
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    p2 = make_pool(client, "P2", [
+        {"batch_id": p1, "portions": 1}, {"batch_id": s1, "portions": 1}])
+    return s1, s2, p1, p2
+
+
+def test_selection_preview_maximizes_count_then_positions(client):
+    s1, s2, p1, p2 = make_p1_p2(client)
+    add_inventory(client, s1, 4)
+    add_inventory(client, s2, 2)
+    # 位置 0/2 各需 2×S1+1×S2，位置 1 需 1×S1+1×S2；全选需 5×S1 超额。
+    # 两两组合都可行（{0,2} 恰好耗尽）：订单数同为 2、次数之和同为 2，
+    # 取位置序列字典序最小的 [0, 1]
+    r = selection_preview(client, [
+        {"batch_id": p2, "times": 1},
+        {"batch_id": p1, "times": 1},
+        {"batch_id": p2, "times": 1},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["selected_positions"] == [0, 1]
+    assert body["unselected_positions"] == [2]
+    assert body["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 3},
+        {"sample_id": s2, "sample_name": "S2", "portions": 2},
+    ]
+    assert [(c["sample_id"], c["balance"]) for c in body["remaining_inventory"]] == [
+        (s1, 1), (s2, 0)]
+
+
+def test_selection_preview_prefers_more_times_over_position(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 5)
+    add_inventory(client, s2, 5)
+    # 两两组合都可行：{0,1} 次数之和 3、{0,2} 为 4、{1,2} 为 5；
+    # 订单数相同先比次数之和，[1, 2] 胜出（字典序更小的 [0, 1] 让位）
+    r = selection_preview(client, [
+        {"batch_id": p1, "times": 1},
+        {"batch_id": p1, "times": 2},
+        {"batch_id": p1, "times": 3},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["selected_positions"] == [1, 2]
+    assert body["unselected_positions"] == [0]
+    assert body["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 5},
+        {"sample_id": s2, "sample_name": "S2", "portions": 5},
+    ]
+    assert [(c["sample_id"], c["balance"]) for c in body["remaining_inventory"]] == [
+        (s1, 0), (s2, 0)]
+
+
+def test_selection_preview_duplicate_batches_are_independent_orders(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 3)
+    add_inventory(client, s2, 3)
+    # 同一批次出现在多个位置：不像整单制备那样合并次数，每个位置独立成单。
+    # {0,1} 与 {1,2} 各需 3×S1+3×S2（恰好耗尽），{0,2} 需 4×S1 超额
+    r = selection_preview(client, [
+        {"batch_id": p1, "times": 2},
+        {"batch_id": p1, "times": 1},
+        {"batch_id": p1, "times": 2},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["selected_positions"] == [0, 1]
+    assert body["unselected_positions"] == [2]
+    assert body["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 3},
+        {"sample_id": s2, "sample_name": "S2", "portions": 3},
+    ]
+
+
+def test_selection_preview_empty_selection_when_inventory_insufficient(client):
+    s1, s2, p1, p2 = make_p1_p2(client)
+    add_inventory(client, s2, 5)  # S1 从未补入：余额 0，任何订单都不可行
+    r = selection_preview(client, [
+        {"batch_id": p1, "times": 1},
+        {"batch_id": p2, "times": 1},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["selected_positions"] == []
+    assert body["unselected_positions"] == [0, 1]
+    assert body["consumptions"] == []
+    assert body["remaining_inventory"] == []
+
+
+def test_selection_preview_exact_balance_is_feasible(client):
+    s1, s2, p1, p2 = make_p1_p2(client)
+    add_inventory(client, s1, 2)
+    add_inventory(client, s2, 1)
+    r = selection_preview(client, [{"batch_id": p2, "times": 1}])  # 恰好耗尽
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["selected_positions"] == [0]
+    assert body["unselected_positions"] == []
+    assert [(c["sample_id"], c["balance"]) for c in body["remaining_inventory"]] == [
+        (s1, 0), (s2, 0)]
+
+
+def test_selection_preview_shared_sample_judged_on_snapshot_total(client):
+    # 同一库存快照：S1 余 5 份，两单各需 3 份，分别看都“够”，
+    # 但快照下只能入选一单；次数相同取位置字典序最小者
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 3}])
+    add_inventory(client, s1, 5)
+    r = selection_preview(client, [
+        {"batch_id": p1, "times": 1},
+        {"batch_id": p1, "times": 1},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["selected_positions"] == [0]
+    assert body["unselected_positions"] == [1]
+    assert body["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 3}]
+
+
+def test_selection_preview_is_readonly(client):
+    s1, s2, p1, p2 = make_p1_p2(client)
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    before_s1 = get_inventory(client, s1).json()
+    before_s2 = get_inventory(client, s2).json()
+    before_batches = client.get("/batches").json()
+
+    r = selection_preview(client, [
+        {"batch_id": p2, "times": 2},
+        {"batch_id": p1, "times": 1},
+    ])
+    assert r.status_code == 200, r.text
+    assert r.json()["selected_positions"] == [0, 1]
+
+    # 不扣减库存、不创建制备记录、不改批次
+    assert get_inventory(client, s1).json() == before_s1
+    assert get_inventory(client, s2).json() == before_s2
+    assert client.get("/preparations/1").status_code == 404
+    assert client.get("/batches").json() == before_batches
+    # 原余额仍可完成同样的整单制备（预演未占用任何库存）
+    assert prepare_job(client, [
+        {"batch_id": p2, "times": 2},
+        {"batch_id": p1, "times": 1},
+    ]).status_code == 201
+
+
+def test_selection_preview_unknown_batch_rejected(client):
+    s1 = make_sample(client, "S1")
+    r = selection_preview(client, [
+        {"batch_id": s1, "times": 1},
+        {"batch_id": 999, "times": 1},
+    ])
+    assert r.status_code == 400
+    assert "999" in r.json()["detail"]
+
+
+def test_selection_preview_item_count_bounds(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 12)
+    # 空清单与超过 12 条都拒绝
+    assert selection_preview(client, []).status_code == 422
+    assert selection_preview(
+        client, [{"batch_id": s1, "times": 1}] * 13).status_code == 422
+    # 恰好 12 条接受：全部入选
+    r = selection_preview(client, [{"batch_id": s1, "times": 1}] * 12)
+    assert r.status_code == 200, r.text
+    assert r.json()["selected_positions"] == list(range(12))
+    assert r.json()["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 12}]
+
+
+@pytest.mark.parametrize("times", [0, -3, 1.5, 2.0, "2", True])
+def test_selection_preview_rejects_non_positive_integer_times(client, times):
+    s1 = make_sample(client, "S1")
+    r = selection_preview(client, [{"batch_id": s1, "times": times}])
+    assert r.status_code == 422
+

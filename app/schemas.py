@@ -274,3 +274,22 @@ class PreparationJobBatchOut(BaseModel):
 class PreparationJobOut(BaseModel):
     preparations: list[PreparationJobBatchOut]  # 各批次制备记录，按批次 id 升序、各一次
     consumptions: list[PreparationConsumptionOut]  # 整单按样本汇总的总消耗，按样本 id 升序
+
+
+class PreparationSelectionPreviewRequest(BaseModel):
+    """排产选择预演：1～12 条候选制备单。
+
+    每条订单按请求位置（items 下标，从 0 开始）标识；允许同一批次重复出现——
+    与整单制备不同，此处不合并次数，每个位置都是独立订单。
+    """
+
+    items: Annotated[list[PreparationJobItem], Field(min_length=1, max_length=12)]
+
+
+class PreparationSelectionPreviewOut(BaseModel):
+    selected_positions: list[int]    # 入选订单位置（items 下标，从 0 开始），升序
+    unselected_positions: list[int]  # 未入选订单位置，升序
+    # 入选订单按样本汇总的消耗，按样本 id 升序；空集时为空列表
+    consumptions: list[PreparationConsumptionOut]
+    # 同一库存快照余额减去入选消耗后的剩余库存（不实际扣减），按样本 id 升序
+    remaining_inventory: list[InventoryOut]

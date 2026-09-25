@@ -425,3 +425,67 @@ def preparation_job_requirements(
         }
         for batch_id, times in items
     }
+
+
+def selection_preview(
+    conn: sqlite3.Connection, items: list[tuple[int, int]]
+) -> tuple[list[int], dict[int, int], dict[int, int]]:
+    """排产选择预演：依据同一库存快照选出可行的最优订单子集（只读）。
+
+    items 为按请求位置排列的 (批次 id, 制备次数)；允许同一批次出现在多个
+    位置——每个位置都是独立订单，不像整单制备那样合并次数。返回：
+
+    - 入选位置升序列表（items 下标，从 0 开始）；
+    - 入选订单按样本汇总的消耗 {原始样本 id: 份数}；
+    - 决策所用的库存快照 {原始样本 id: 余额}，覆盖全部候选订单涉及的样本
+      （未补入库存的样本余额为 0）。
+
+    可行性：入选订单对每一样本的汇总需求均不超过快照余额。最优性：先最大化
+    入选订单数，再最大化入选制备次数之和，仍并列时取入选位置序列字典序最小
+    者；库存不足时允许空集。候选最多 12 条，直接枚举全部子集（2^12 = 4096）
+    逐一核对。只读：不扣减库存、不创建制备记录。
+    """
+    kinds, recipes = _load_graph(conn)
+    memo: UnitNeeds = {}
+    demands = [
+        {
+            sample_id: unit * times
+            for sample_id, unit in _unit_needs(kinds, recipes, batch_id, memo).items()
+        }
+        for batch_id, times in items
+    ]
+
+    # 同一库存快照：一次性读出全部相关样本余额，选择过程中不随订单“扣减”
+    sample_ids = sorted({sid for demand in demands for sid in demand})
+    balances = (
+        {
+            row["sample_id"]: row["balance"]
+            for row in conn.execute(
+                "SELECT sample_id, balance FROM sample_inventory WHERE sample_id IN (%s)"
+                % ", ".join("?" for _ in sample_ids),
+                sample_ids,
+            )
+        }
+        if sample_ids
+        else {}
+    )
+
+    best_positions: tuple[int, ...] = ()
+    best_key = (0, 0)  # (入选订单数, 入选制备次数之和)
+    best_consumption: dict[int, int] = {}
+    for mask in range(1 << len(items)):
+        positions = tuple(i for i in range(len(items)) if mask >> i & 1)
+        key = (len(positions), sum(items[i][1] for i in positions))
+        if key < best_key:
+            continue  # 订单数或次数之和已严格更差，无需再核对库存
+        consumption: dict[int, int] = {}
+        for i in positions:
+            for sample_id, portions in demands[i].items():
+                consumption[sample_id] = consumption.get(sample_id, 0) + portions
+        if any(portions > balances.get(sid, 0) for sid, portions in consumption.items()):
+            continue
+        if key > best_key or positions < best_positions:
+            best_key = key
+            best_positions = positions
+            best_consumption = consumption
+    return list(best_positions), best_consumption, balances
